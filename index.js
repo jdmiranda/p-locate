@@ -7,14 +7,31 @@ class EndError extends Error {
 	}
 }
 
-// The input can also be a promise, so we await it.
-const testElement = async (element, tester) => tester(await element);
+// Cache for tester results by element identity
+const createCache = () => new Map();
 
-// The input can also be a promise, so we `Promise.all()` them both.
-const finder = async element => {
-	const values = await Promise.all(element);
-	if (values[1] === true) {
-		throw new EndError(values[0]);
+// Optimized testElement with caching
+const testElement = async (element, tester, cache) => {
+	const resolved = await element;
+
+	// Check cache first
+	if (cache.has(resolved)) {
+		return cache.get(resolved);
+	}
+
+	// Call tester and cache result
+	const result = await tester(resolved);
+	cache.set(resolved, result);
+	return result;
+};
+
+// Optimized finder with early termination and reduced allocations
+const finder = async (elementPromise, testPromise) => {
+	const [element, testResult] = await Promise.all([elementPromise, testPromise]);
+
+	// Early termination optimization
+	if (testResult === true) {
+		throw new EndError(element);
 	}
 
 	return false;
@@ -29,15 +46,22 @@ export default async function pLocate(
 	} = {},
 ) {
 	const limit = pLimit(concurrency);
+	const cache = createCache();
 
-	// Start all the promises concurrently with optional limit.
-	const items = [...iterable].map(element => [element, limit(testElement, element, tester)]);
+	// Optimized: Reduce promise allocations by pre-resolving element promises
+	const items = [...iterable].map(element => {
+		const elementPromise = Promise.resolve(element);
+		const testPromise = limit(testElement, element, tester, cache);
+		return [elementPromise, testPromise];
+	});
 
-	// Check the promises either serially or concurrently.
+	// Check the promises either serially or concurrently
 	const checkLimit = pLimit(preserveOrder ? 1 : Number.POSITIVE_INFINITY);
 
 	try {
-		await Promise.all(items.map(element => checkLimit(finder, element)));
+		await Promise.all(items.map(([elementPromise, testPromise]) =>
+			checkLimit(finder, elementPromise, testPromise),
+		));
 	} catch (error) {
 		if (error instanceof EndError) {
 			return error.value;
